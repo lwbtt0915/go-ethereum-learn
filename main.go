@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"golang.org/x/crypto/sha3"
 	"log"
 	"math/big"
 	"net/http"
@@ -68,30 +71,100 @@ func initMySQL() error {
 }
 
 // 解析合约事件日志
+// parseEventLog 修正版：解析合约事件日志，返回结构化参数、事件名称、错误
+// 入参：
+//
+//	log: 原始合约日志
+//	abiObj: 已解析的合约ABI对象
+//
+// 出参：
+//
+//	map[string]interface{}: 事件参数（key=参数名，value=参数值，地址/哈希转成十六进制字符串，uint256转成*big.Int）
+//	string: 匹配到的事件名称
+//	error: 解析错误
 func parseEventLog(log types.Log, abiObj abi.ABI) (map[string]interface{}, string, error) {
-	// 遍历ABI中的事件，匹配日志的Topic[0]（事件签名哈希）
-	for _, event := range abiObj.Events {
-		eventSigHash := abiObj.EventID(event).Hex()
-		if log.Topics[0].Hex() == eventSigHash {
-			// 解析事件参数
+	// 边界条件：检查日志Topics是否为空，避免数组越界
+	if len(log.Topics) == 0 {
+		return nil, "", fmt.Errorf("日志Topics为空，无法匹配事件")
+	}
+
+	// 遍历ABI中的所有事件，匹配Topic[0]（事件签名哈希）
+	targetTopic0 := log.Topics[0].Hex()
+	for eventName, event := range abiObj.Events { // 改用key-value遍历，直接获取事件名称更高效
+		// 计算事件签名哈希并转成十六进制字符串，用于匹配
+		var inputTypes []string
+		for _, input := range event.Inputs {
+			inputTypes = append(inputTypes, input.Type.String())
+		}
+		eventSig := fmt.Sprintf("%s(%s)", eventName, strings.Join(inputTypes, ","))
+
+		// 2. keccak256哈希计算事件签名
+		hash := sha3.NewLegacyKeccak256()
+		hash.Write([]byte(eventSig))
+		eventSigHash := hexutil.Encode(hash.Sum(nil))
+
+		if targetTopic0 == eventSigHash {
+			// 初始化事件参数map
 			eventData := make(map[string]interface{})
-			if err := abiObj.UnpackIntoMap(eventData, event.Name, log.Data); err != nil {
-				return nil, "", fmt.Errorf("解析事件数据失败: %v", err)
-			}
-			// 解析索引化参数（Topic[1:]）
-			for i, input := range event.Inputs {
-				if input.Indexed && i < len(log.Topics)-1 {
-					val, err := abi.parseParameter(input.Type, log.Topics[i+1].Bytes())
-					if err != nil {
-						return nil, "", fmt.Errorf("解析索引参数失败: %v", err)
-					}
-					eventData[input.Name] = val
+
+			// 1. 解析非索引化参数（log.Data）
+			if len(log.Data) > 0 {
+				if err := abiObj.UnpackIntoMap(eventData, eventName, log.Data); err != nil {
+					return nil, "", fmt.Errorf("解析[%s]事件非索引参数失败: %v", eventName, err)
 				}
 			}
-			return eventData, event.Name, nil
+
+			// 2. 解析索引化参数（log.Topics[1:]）
+			topicIndex := 1 // Topics[0]是事件签名，从1开始是索引参数
+			for _, input := range event.Inputs {
+				if !input.Indexed {
+					continue // 跳过非索引化参数
+				}
+				// 边界检查：避免Topics数组越界
+				if topicIndex >= len(log.Topics) {
+					return nil, "", fmt.Errorf("解析[%s]事件索引参数[%s]失败: Topics长度不足", eventName, input.Name)
+				}
+
+				// 解析索引参数的字节数据
+				topicBytes := log.Topics[topicIndex].Bytes()
+				//	val, err := input.Type.Unmarshal(topicBytes)
+
+				// 使用 abi.Arguments 来解码参数
+				argument := abi.Argument{Type: input.Type}
+				arguments := abi.Arguments{argument}
+				unpacked, err := arguments.UnpackValues(topicBytes)
+				if err != nil {
+					return nil, "", fmt.Errorf("解析[%s]事件索引参数[%s]失败: %v", eventName, input.Name, err)
+				}
+
+				var val interface{}
+				if len(unpacked) > 0 {
+					val = unpacked[0]
+				}
+
+				// 友好转换：将地址/哈希转成十六进制字符串，提升可读性
+				switch v := val.(type) {
+				case common.Address:
+					eventData[input.Name] = v.Hex()
+				case common.Hash:
+					eventData[input.Name] = v.Hex()
+				case [32]byte:
+					eventData[input.Name] = hex.EncodeToString(v[:])
+				case *big.Int:
+					eventData[input.Name] = v // uint256保留*big.Int类型，方便后续计算
+				default:
+					eventData[input.Name] = v // 其他类型直接返回
+				}
+
+				topicIndex++ // 索引参数计数器+1
+			}
+
+			return eventData, eventName, nil
 		}
 	}
-	return nil, "", fmt.Errorf("未匹配到事件")
+
+	// 未匹配到任何事件
+	return nil, "", fmt.Errorf("未匹配到任何事件，Topic0: %s", targetTopic0)
 }
 
 // 监听合约事件并写入数据库
