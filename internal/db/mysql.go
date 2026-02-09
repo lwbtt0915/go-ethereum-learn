@@ -11,6 +11,6 @@ func Init(dsn string) *gorm.DB {
 		panic(err)
 	}
 
-	db.AutoMigrate(&ERC20Event{}, &ERC721Event{})
+	//	db.AutoMigrate(&ERC20Event{}, &ERC721Event{})
 	return db
 }
